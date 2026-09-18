@@ -485,5 +485,17 @@ private final class DiskImageInstallDestinationPrompt: NSObject {
     @objc func updateDestination(_ sender: NSButton) {
         let folder = sender.state == .on ? strings.userApplicationsFolder : strings.applicationsFolder
         alert.informativeText = String(format: strings.promptBodyFormat, displayName, folder)
+        // The alert keeps the height it was laid out with, and the home-folder
+        // wording can need one more line than the default one, which would cut
+        // its last line off. Lay the alert out again for the longer wording,
+        // keeping the bottom edge in place so the options stay under the
+        // pointer; the shorter wording simply leaves that line blank.
+        guard sender.state == .on, alert.window.isVisible else { return }
+        let window = alert.window
+        let bottom = window.frame.minY
+        alert.layout()
+        var frame = window.frame
+        frame.origin.y = bottom
+        window.setFrame(frame, display: true)
     }
 }
