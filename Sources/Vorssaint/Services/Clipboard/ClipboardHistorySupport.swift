@@ -3,6 +3,46 @@
 
 import Foundation
 
+/// Main-thread capture admission. Expiring a result does not release the
+/// actual queued read; stop/start must not release it either.
+struct ClipboardHistoryCaptureState {
+    private(set) var generation = 0
+    private(set) var inFlight = false
+    private(set) var needsBaseline = true
+
+    mutating func restart() {
+        generation &+= 1
+        needsBaseline = true
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+    }
+
+    mutating func begin() -> Int? {
+        guard !inFlight else { return nil }
+        inFlight = true
+        generation &+= 1
+        return generation
+    }
+
+    func accepts(_ token: Int) -> Bool {
+        token == generation
+    }
+
+    mutating func expire(_ token: Int) {
+        if accepts(token) { invalidate() }
+    }
+
+    mutating func finish() {
+        inFlight = false
+    }
+
+    mutating func didBaseline() {
+        needsBaseline = false
+    }
+}
+
 enum ClipboardHistoryEntryKind: String, Codable {
     case text
     case image
@@ -96,7 +136,10 @@ struct ClipboardHistoryEntry: Codable, Equatable, Identifiable {
         switch kind {
         case .text: return text
         case .image: return "\(imageLabel) png \(imageDimensionsLabel)"
-        case .files: return fileNames.joined(separator: " ")
+        case .files:
+            let names = fileNames.joined(separator: " ")
+            let hasImage = filePaths.contains { ClipboardHistoryImageSupport.isImageFileName($0) }
+            return hasImage ? "\(imageLabel) \(names)" : names
         }
     }
 
@@ -131,6 +174,11 @@ enum ClipboardHistoryEditing {
     /// again merely to draw its list preview.
     static let previewCharacters = 2_000
 
+    struct EncodedHistory {
+        let entries: [ClipboardHistoryEntry]
+        let data: Data
+    }
+
     static func storableText(_ text: String) -> String? {
         guard text.count <= maxCharacters,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -159,7 +207,8 @@ enum ClipboardHistoryEditing {
             return result
         }
         let pinned = retained(entries.filter(\.isPinned), limit: nil)
-        let recent = retained(entries.filter { !$0.isPinned }, limit: max(0, recentLimit))
+        let recentLimitOrNil = recentLimit <= 0 ? nil : recentLimit
+        let recent = retained(entries.filter { !$0.isPinned }, limit: recentLimitOrNil)
         return pinned + recent
     }
 
@@ -172,6 +221,38 @@ enum ClipboardHistoryEditing {
     static func canLoadEncodedHistory(byteCount: Int?) -> Bool {
         guard let byteCount else { return false }
         return byteCount >= 0 && byteCount <= maxEncodedHistoryBytes
+    }
+
+    /// Encodes a readable snapshot without ever writing a file the next
+    /// launch would reject. JSON escaping can make stored data much larger
+    /// than the raw UTF-8 text budget, so the encoded bound must be enforced
+    /// on the actual bytes rather than estimated from the strings.
+    static func encodedHistory(_ entries: [ClipboardHistoryEntry],
+                               byteLimit: Int = maxEncodedHistoryBytes) -> EncodedHistory? {
+        guard byteLimit >= 2 else { return nil }
+        let encoder = JSONEncoder()
+        let ordered = entries.filter(\.isPinned) + entries.filter { !$0.isPinned }
+        var retained: [ClipboardHistoryEntry] = []
+        var encodedEntries: [Data] = []
+        var encodedSize = 2 // Opening and closing brackets.
+
+        for entry in ordered {
+            guard let encoded = try? encoder.encode(entry) else { return nil }
+            let addedSize = encoded.count + (encodedEntries.isEmpty ? 0 : 1)
+            guard encodedSize + addedSize <= byteLimit else { continue }
+            retained.append(entry)
+            encodedEntries.append(encoded)
+            encodedSize += addedSize
+        }
+
+        var data = Data(capacity: encodedSize)
+        data.append(0x5B)
+        for (index, encoded) in encodedEntries.enumerated() {
+            if index > 0 { data.append(0x2C) }
+            data.append(encoded)
+        }
+        data.append(0x5D)
+        return EncodedHistory(entries: retained, data: data)
     }
 }
 
@@ -245,8 +326,11 @@ enum ClipboardHistorySearch {
 
     private static func normalized(_ value: String) -> String {
         value
+            // No locale: Turkish folds a dotted I to a dotless one, and a
+            // search that inherited the Mac's locale would stop finding
+            // "ISTANBUL" for someone who typed "istanbul".
             .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
-                     locale: .current)
+                     locale: nil)
             .lowercased()
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\t", with: " ")
@@ -274,6 +358,37 @@ enum ClipboardHistorySelection {
 enum ClipboardHistoryPreview {
     static func handlesSpace(selectionIsVisible: Bool, hasModifiers: Bool) -> Bool {
         selectionIsVisible && !hasModifiers
+    }
+}
+
+enum ClipboardHistoryEscape {
+    enum Action: Equatable {
+        case clearBatchSelection
+        case hideWindow
+    }
+
+    /// Esc backs out one layer at a time - selection, then the window.
+    /// Preview is a persistent view setting, not a layer: only clicking its
+    /// own toggle turns it off (or Space, but only once arrow-key navigation
+    /// has made a row's selection visible - see `ClipboardHistoryPreview
+    /// .handlesSpace`; while the search field has focus, Space just types),
+    /// so a keystroke meant to close the panel can never silently re-hide
+    /// it first.
+    static func action(batchCount: Int) -> Action {
+        batchCount > 0 ? .clearBatchSelection : .hideWindow
+    }
+}
+
+enum ClipboardHistoryFocus {
+    /// Which side owns an ordinary key press while a text view holds focus in
+    /// the quick panel. A composing input method always wins: Return confirms
+    /// the candidate, the arrows walk it and Esc drops it, so claiming those
+    /// keys leaves the search field unusable in Chinese, Japanese and Korean.
+    /// Outside composition the multiline editor keeps its editing keys, while
+    /// the search field (a field editor) and the read-only preview leave the
+    /// list's shortcuts intact.
+    static func textViewOwnsKeys(isComposing: Bool, isFieldEditor: Bool, isEditable: Bool) -> Bool {
+        isComposing || (isEditable && !isFieldEditor)
     }
 }
 
@@ -347,6 +462,10 @@ enum ClipboardHistoryBatch {
 
     static func listOwnsSelectAllShortcut(batchCount: Int, queryIsEmpty: Bool) -> Bool {
         batchCount > 0 || queryIsEmpty
+    }
+
+    static func listOwnsDeleteShortcut(batchCount: Int) -> Bool {
+        batchCount > 0
     }
 
     /// The plain-text side of a rich batch, for targets that only take text.
@@ -471,5 +590,21 @@ enum ClipboardHistorySensitiveText {
             return false
         }
         return true
+    }
+}
+
+enum ClipboardHistoryImageSupport {
+    static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "heic", "heif", "tiff", "tif", "gif", "webp", "bmp", "ico", "icns", "svg", "avif"
+    ]
+
+    static func isImageFileName(_ name: String) -> Bool {
+        let ext = (name as NSString).pathExtension.lowercased()
+        return imageExtensions.contains(ext)
+    }
+
+    static func isImageFilePath(_ path: String, fileManager: FileManager = .default) -> Bool {
+        guard isImageFileName(path) else { return false }
+        return fileManager.fileExists(atPath: path)
     }
 }

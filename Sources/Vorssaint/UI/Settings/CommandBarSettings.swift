@@ -20,6 +20,7 @@ struct CommandBarSettings: View {
     @State private var editing: CommandBarLink?
     @State private var ignoreDraft = ""
     @State private var showsFileOptions = false
+    @State private var showsAppShortcuts = false
 
     private var text: CommandBarFeatureStrings { FeatureStrings.commandBar(l10n.language) }
     /// The snippet library already says "save", "delete" and "name" in every
@@ -99,6 +100,17 @@ struct CommandBarSettings: View {
             }
 
             Section {
+                Button {
+                    showsAppShortcuts = true
+                } label: {
+                    Label(text.appCenterTitle, systemImage: "app.badge")
+                }
+                Text(text.appCenterCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 ForEach(CommandBarSource.allCases) { source in
                     Toggle(isOn: binding(for: source)) {
                         Label(title(for: source), systemImage: source.symbolName)
@@ -143,35 +155,41 @@ struct CommandBarSettings: View {
                 } label: {
                     Label(text.filesAddFolder, systemImage: "plus")
                 }
-                DisclosureGroup(FeatureStrings.recorder(l10n.language).moreOptions,
-                                isExpanded: $showsFileOptions) {
-                    Text(text.filesIgnoreCaption)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ForEach(fileIgnores, id: \.self) { pattern in
+                DisclosureHeaderRow(isExpanded: $showsFileOptions) {
+                    Text(FeatureStrings.recorder(l10n.language).moreOptions)
+                    Spacer()
+                }
+                if showsFileOptions {
+                    Group {
+                        Text(text.filesIgnoreCaption)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(fileIgnores, id: \.self) { pattern in
+                            HStack(spacing: 8) {
+                                Image(systemName: "eye.slash")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 16)
+                                Text(pattern)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                Spacer()
+                                Button(text.removeButton) { removeFileIgnore(pattern) }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                            }
+                        }
                         HStack(spacing: 8) {
-                            Image(systemName: "eye.slash")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 16)
-                            Text(pattern)
-                                .font(.system(size: 12))
-                                .lineLimit(1)
-                            Spacer()
-                            Button(text.removeButton) { removeFileIgnore(pattern) }
+                            TextField(text.filesIgnorePlaceholder, text: $ignoreDraft)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit { addFileIgnore() }
+                            Button(text.filesIgnoreAdd) { addFileIgnore() }
                                 .buttonStyle(.bordered)
-                                .controlSize(.mini)
+                                .controlSize(.small)
+                                .disabled(ignoreDraft.trimmingCharacters(in: .whitespaces).isEmpty)
                         }
                     }
-                    HStack(spacing: 8) {
-                        TextField(text.filesIgnorePlaceholder, text: $ignoreDraft)
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { addFileIgnore() }
-                        Button(text.filesIgnoreAdd) { addFileIgnore() }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(ignoreDraft.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
+                    .disclosureIndent()
                 }
             } header: {
                 Text(text.filesTitle)
@@ -317,6 +335,9 @@ struct CommandBarSettings: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $showsAppShortcuts) {
+            CommandBarAppShortcutsView()
+        }
         .sheet(item: $editing) { link in
             CommandBarLinkEditor(draft: link, text: text, common: common) { saved in
                 save(saved)
@@ -367,8 +388,9 @@ struct CommandBarSettings: View {
     }
 
     /// A key whose row is not in the catalog right now (an app that was
-    /// removed, a feature switched off in the hub) still shows, by its key, so
-    /// nothing the person set can become invisible and unremovable.
+    /// removed) still shows, by its key, so nothing the person set can become
+    /// invisible and unremovable. An uninstalled hub feature is dropped
+    /// instead: its pin is not a leftover id.
     private func title(forKey key: String) -> String {
         service.entryTitle(forStableKey: key) ?? key
     }
@@ -380,7 +402,9 @@ struct CommandBarSettings: View {
     }
 
     private var pinned: [NamedRow] {
-        CommandBarPreferences.decodePins(pinsRaw)
+        CommandBarPreferences.listedPins(
+            CommandBarPreferences.decodePins(pinsRaw),
+            present: service.presentStableKeys)
             .map { NamedRow(key: $0, title: title(forKey: $0), alias: "") }
     }
 
@@ -407,6 +431,7 @@ struct CommandBarSettings: View {
         case .menus: return text.sourceMenus
         case .windows: return text.sourceWindows
         case .quitApps: return text.sourceQuitApps
+        case .uninstallApps: return l10n.s.uninstallerName
         case .settingsPages: return text.sourceSettingsPages
         case .macSettings: return text.sourceMacSettings
         case .snippets: return text.sourceSnippets

@@ -4,6 +4,7 @@
 import AppKit
 import Darwin
 import Foundation
+import SwiftUI
 
 final class DiskImageInstallerService {
     static let shared = DiskImageInstallerService()
@@ -28,10 +29,15 @@ final class DiskImageInstallerService {
     }
 
     private enum InstallOutcome {
-        case installed
+        case installed(downloadTrashed: Bool)
         case installedKeepingMount
         case installedKeepingDownload
         case failed(InstallFailure)
+
+        var isInstalled: Bool {
+            if case .failed = self { return false }
+            return true
+        }
     }
 
     private struct InstallResult {
@@ -50,6 +56,7 @@ final class DiskImageInstallerService {
     private var pending: [Candidate] = []
     private var processingMounts = Set<String>()
     private var promptActive = false
+    private var progressPanel: NSPanel?
 
     private init() {}
 
@@ -125,9 +132,9 @@ final class DiskImageInstallerService {
         let useUserApplications = UserDefaults.standard.bool(
             forKey: DefaultsKey.diskImageInstallerUseUserApplications)
         guard apps.count == 1, let appURL = apps.first,
-              let collisionURLs = Self.collisionURLs(for: appURL,
-                                                      useUserApplications: useUserApplications,
-                                                      fileManager: fm),
+              let collisionURLs = DiskImageInstallerSupport.collisionURLs(for: appURL,
+                useUserApplications: useUserApplications,
+                fileManager: fm),
               collisionURLs.allSatisfy({ !fm.fileExists(atPath: $0.path) })
         else { return nil }
 
@@ -148,24 +155,102 @@ final class DiskImageInstallerService {
         let strings = FeatureStrings.diskImageInstaller(L10n.shared.language)
         let alert = NSAlert()
         alert.messageText = strings.promptTitle
-        alert.informativeText = String(format: strings.promptBodyFormat, candidate.displayName)
         alert.icon = NSWorkspace.shared.icon(forFile: candidate.appURL.path)
         alert.addButton(withTitle: strings.installButton)
         alert.addButton(withTitle: L10n.shared.s.uninstallerCancel)
+
+        let defaults = UserDefaults.standard
+        let trashDownload = NSButton(checkboxWithTitle: strings.trashDownloadOption, target: nil, action: nil)
+        trashDownload.state = defaults.bool(forKey: DefaultsKey.diskImageInstallerTrashesDownload) ? .on : .off
+        let revealApp = NSButton(checkboxWithTitle: strings.revealAppOption, target: nil, action: nil)
+        revealApp.state = defaults.bool(forKey: DefaultsKey.diskImageInstallerRevealsApp) ? .on : .off
+        let destinationPrompt = DiskImageInstallDestinationPrompt(alert: alert, strings: strings,
+                                                                  displayName: candidate.displayName)
+        let userApplications = NSButton(checkboxWithTitle: strings.useUserApplications,
+                                        target: destinationPrompt,
+                                        action: #selector(DiskImageInstallDestinationPrompt.updateDestination(_:)))
+        userApplications.state = defaults.bool(forKey: DefaultsKey.diskImageInstallerUseUserApplications) ? .on : .off
+        destinationPrompt.updateDestination(userApplications)
+        let options = NSStackView(views: [trashDownload, revealApp, userApplications])
+        options.orientation = .vertical
+        options.alignment = .leading
+        options.spacing = 6
+        options.frame = NSRect(origin: .zero, size: options.fittingSize)
+        alert.accessoryView = options
+
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else {
+        guard withExtendedLifetime(destinationPrompt, { alert.runModal() }) == .alertFirstButtonReturn else {
             finishCurrentCandidate()
             return
         }
+        let trashesDownload = trashDownload.state == .on
+        let revealsApp = revealApp.state == .on
+        let usesUserApplications = userApplications.state == .on
+        defaults.set(trashesDownload, forKey: DefaultsKey.diskImageInstallerTrashesDownload)
+        defaults.set(revealsApp, forKey: DefaultsKey.diskImageInstallerRevealsApp)
+        defaults.set(usesUserApplications, forKey: DefaultsKey.diskImageInstallerUseUserApplications)
+        showProgress(for: candidate, strings: strings)
 
         workQueue.async { [weak self] in
-            let result = self?.install(candidate)
+            let result = self?.install(candidate, trashingDownload: trashesDownload,
+                                       useUserApplications: usesUserApplications)
                 ?? InstallResult(outcome: .failed(.copy), destinationURL: nil)
             DispatchQueue.main.async { [weak self] in
+                self?.hideProgress()
                 self?.present(result: result, candidate: candidate)
+                if revealsApp, result.outcome.isInstalled, let destinationURL = result.destinationURL {
+                    NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
+                }
                 self?.finishCurrentCandidate()
             }
         }
+    }
+
+    /// Copying and verifying take a few seconds with nothing else on screen,
+    /// which reads as a failure. A quiet floating card keeps the wait honest.
+    private func showProgress(for candidate: Candidate, strings: DiskImageInstallerStrings) {
+        let host = NSHostingController(rootView: DiskImageInstallProgressView(
+            icon: NSWorkspace.shared.icon(forFile: candidate.appURL.path),
+            message: String(format: strings.installingFormat, candidate.displayName)))
+        host.view.layoutSubtreeIfNeeded()
+        let size = host.view.fittingSize
+
+        let panel = progressPanel ?? Self.makeProgressPanel()
+        progressPanel = panel
+        panel.contentViewController = host
+        let screen = NSScreen.pointerVisibleFrame
+        panel.setFrame(NSRect(x: (screen.midX - size.width / 2).rounded(),
+                              y: (screen.maxY - size.height - 24).rounded(),
+                              width: size.width,
+                              height: size.height),
+                       display: true)
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            panel.animator().alphaValue = 1
+        }
+    }
+
+    private func hideProgress() {
+        progressPanel?.orderOut(nil)
+        progressPanel?.contentViewController = nil
+    }
+
+    private static func makeProgressPanel() -> NSPanel {
+        let panel = NSPanel(contentRect: .zero,
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered,
+                            defer: false)
+        panel.level = .statusBar
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        return panel
     }
 
     private func finishCurrentCandidate() {
@@ -173,10 +258,9 @@ final class DiskImageInstallerService {
         presentNextCandidate()
     }
 
-    private func install(_ candidate: Candidate) -> InstallResult {
+    private func install(_ candidate: Candidate, trashingDownload: Bool,
+                         useUserApplications: Bool) -> InstallResult {
         let fm = FileManager.default
-        let useUserApplications = UserDefaults.standard.bool(
-            forKey: DefaultsKey.diskImageInstallerUseUserApplications)
         let applicationsDomain = DiskImageInstallerSupport.applicationsDomain(
             useUserApplications: useUserApplications)
         guard let applicationsURL = try? fm.url(for: .applicationDirectory,
@@ -186,9 +270,9 @@ final class DiskImageInstallerService {
               let destinationURL = DiskImageInstallerSupport.destinationURL(
                 for: candidate.appURL,
                 applicationsURL: applicationsURL),
-              let collisionURLs = Self.collisionURLs(for: candidate.appURL,
-                                                      useUserApplications: useUserApplications,
-                                                      fileManager: fm),
+              let collisionURLs = DiskImageInstallerSupport.collisionURLs(for: candidate.appURL,
+                useUserApplications: useUserApplications,
+                fileManager: fm),
               collisionURLs.contains(destinationURL)
         else {
             return InstallResult(outcome: .failed(.copy), destinationURL: nil)
@@ -211,8 +295,11 @@ final class DiskImageInstallerService {
 
         let stagedApp = stagingDirectory.appendingPathComponent(candidate.appURL.lastPathComponent,
                                                                  isDirectory: true)
+        // Carrying the mounted image's quarantine over leaves the installed app eligible for
+        // path randomization, so macOS runs it from a read-only random location instead of
+        // Applications. The checks below are the same assessment that flag defers to.
         let copy = Self.run("/usr/bin/ditto", arguments: [
-            "--rsrc", "--extattr", "--acl", "--qtn",
+            "--rsrc", "--extattr", "--acl", "--noqtn",
             candidate.appURL.path, stagedApp.path,
         ])
         guard copy.status == 0, Self.validBundle(at: stagedApp) else {
@@ -223,7 +310,7 @@ final class DiskImageInstallerService {
         }
 
         do {
-            guard let finalCollisionURLs = Self.collisionURLs(
+            guard let finalCollisionURLs = DiskImageInstallerSupport.collisionURLs(
                 for: candidate.appURL,
                 useUserApplications: useUserApplications,
                 fileManager: fm),
@@ -246,55 +333,48 @@ final class DiskImageInstallerService {
             return InstallResult(outcome: .installedKeepingMount, destinationURL: destinationURL)
         }
 
+        guard trashingDownload else {
+            return InstallResult(outcome: .installed(downloadTrashed: false),
+                                 destinationURL: destinationURL)
+        }
         guard Self.fileIdentity(at: candidate.imageURL) == candidate.imageIdentity else {
             return InstallResult(outcome: .installedKeepingDownload,
                                  destinationURL: destinationURL)
         }
         do {
             try fm.trashItem(at: candidate.imageURL, resultingItemURL: nil)
-            return InstallResult(outcome: .installed, destinationURL: destinationURL)
+            return InstallResult(outcome: .installed(downloadTrashed: true),
+                                 destinationURL: destinationURL)
         } catch {
             return InstallResult(outcome: .installedKeepingDownload,
                                  destinationURL: destinationURL)
         }
     }
 
-    private static func collisionURLs(for appURL: URL,
-                                      useUserApplications: Bool,
-                                      fileManager fm: FileManager) -> [URL]? {
-        let domains = DiskImageInstallerSupport.collisionDomains(
-            useUserApplications: useUserApplications)
-        var applicationsURLs: [URL] = []
-        for domain in domains {
-            guard let applicationsURL = try? fm.url(for: .applicationDirectory,
-                                                    in: domain,
-                                                    appropriateFor: nil,
-                                                    create: false) else { return nil }
-            applicationsURLs.append(applicationsURL)
-        }
-        return DiskImageInstallerSupport.destinationURLs(for: appURL,
-                                                         applicationsURLs: applicationsURLs)
-    }
-
     private func present(result: InstallResult, candidate: Candidate) {
         let strings = FeatureStrings.diskImageInstaller(L10n.shared.language)
         let alert = NSAlert()
+        let folder = result.destinationURL?.deletingLastPathComponent().path == "/Applications"
+            ? strings.applicationsFolder : strings.userApplicationsFolder
         alert.icon = NSWorkspace.shared.icon(forFile: result.destinationURL?.path
                                               ?? candidate.appURL.path)
         switch result.outcome {
-        case .installed:
+        case let .installed(downloadTrashed):
             alert.messageText = strings.installedTitle
-            alert.informativeText = String(format: strings.installedBodyFormat, candidate.displayName)
+            alert.informativeText = String(format: downloadTrashed
+                                               ? strings.installedBodyFormat
+                                               : strings.installedKeptDownloadBodyFormat,
+                                           candidate.displayName, folder)
         case .installedKeepingMount:
             alert.alertStyle = .warning
             alert.messageText = strings.installedTitle
             alert.informativeText = String(format: strings.installedKeepingMountBodyFormat,
-                                           candidate.displayName)
+                                           candidate.displayName, folder)
         case .installedKeepingDownload:
             alert.alertStyle = .warning
             alert.messageText = strings.installedTitle
             alert.informativeText = String(format: strings.installedKeepingDownloadBodyFormat,
-                                           candidate.displayName)
+                                           candidate.displayName, folder)
         case let .failed(failure):
             alert.alertStyle = .warning
             alert.messageText = strings.failedTitle
@@ -356,5 +436,54 @@ final class DiskImageInstallerService {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return CommandResult(status: process.terminationStatus, output: data)
+    }
+}
+
+private struct DiskImageInstallProgressView: View {
+    let icon: NSImage
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: 36, height: 36)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+            }
+            .frame(width: 220, alignment: .leading)
+        }
+        .padding(14)
+        .background(HUDBackdrop(cornerRadius: 16))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(message)
+    }
+}
+
+private final class DiskImageInstallDestinationPrompt: NSObject {
+    let alert: NSAlert
+    let strings: DiskImageInstallerStrings
+    let displayName: String
+
+    init(alert: NSAlert, strings: DiskImageInstallerStrings, displayName: String) {
+        self.alert = alert
+        self.strings = strings
+        self.displayName = displayName
+    }
+
+    @objc func updateDestination(_ sender: NSButton) {
+        let folder = sender.state == .on ? strings.userApplicationsFolder : strings.applicationsFolder
+        alert.informativeText = String(format: strings.promptBodyFormat, displayName, folder)
     }
 }

@@ -110,7 +110,8 @@ struct UninstallFailureNote: View {
                     .font(compact ? .system(size: 9.5) : .caption2)
                     .foregroundStyle(.tertiary)
             }
-            if !permissions.fullDiskAccess {
+            if !permissions.fullDiskAccess,
+               UninstallerSupport.failureNeedsFullDiskAccess(paths: items.map(\.url.path)) {
                 FullDiskAccessNote(compact: compact, reason: l10n.s.uninstallerFailedNeedsFDA)
             }
         }
@@ -145,6 +146,7 @@ struct HUDBackdrop: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppStorage(DefaultsKey.liquidGlassEnabled) private var liquidGlassEnabled = false
 
     private var materialOpacity: Double {
         reduceTransparency ? 1 : min(max(opacity, 0), 1)
@@ -156,12 +158,38 @@ struct HUDBackdrop: View {
     /// plate alone carries white text to 4.8:1 and black text to 5.3:1, both
     /// past the 4.5:1 the accessibility guidelines ask of body text, and the
     /// real material only ever adds to that.
+    static func plateOpacity(dark: Bool) -> Double { dark ? 0.55 : 0.5 }
+
     private var plateOpacity: Double {
         guard contrast == .high, !reduceTransparency else { return 0 }
-        return colorScheme == .dark ? 0.55 : 0.5
+        return Self.plateOpacity(dark: colorScheme == .dark)
     }
 
     var body: some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *), liquidGlassEnabled, !reduceTransparency {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.clear)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(colorScheme == .dark ? Color.black : Color.white)
+                        .opacity(plateOpacity)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08), lineWidth: 0.8)
+                )
+        } else {
+            classicBackdrop
+        }
+#else
+        classicBackdrop
+#endif
+    }
+
+    @ViewBuilder
+    private var classicBackdrop: some View {
         HUDBackdropMaterial(cornerRadius: cornerRadius, opacity: materialOpacity)
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -207,25 +235,44 @@ private struct HUDBackdropMaterial: NSViewRepresentable {
     }
 }
 
-/// Plays an animated image. SwiftUI's Image shows only the first frame of a
-/// GIF, so anything that has to move goes through AppKit.
-struct AnimatedGIFView: NSViewRepresentable {
-    let image: NSImage
+/// A disclosure header where the whole row toggles the group and the chevron
+/// sits on the trailing side, the way a drop-down reads. The label supplies
+/// the row's one Spacer, so trailing accessories stay flush to the chevron.
+struct DisclosureHeaderRow<Label: View>: View {
+    @ObservedObject private var l10n = L10n.shared
 
-    func makeNSView(context: Context) -> NSImageView {
-        let view = NSImageView()
-        view.imageAlignment = .alignCenter
-        view.imageScaling = .scaleProportionallyUpOrDown
-        view.animates = true
-        view.wantsLayer = true
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        return view
+    private let isExpanded: Binding<Bool>
+    private let label: () -> Label
+
+    init(isExpanded: Binding<Bool>, @ViewBuilder label: @escaping () -> Label) {
+        self.isExpanded = isExpanded
+        self.label = label
     }
 
-    func updateNSView(_ view: NSImageView, context: Context) {
-        guard view.image !== image else { return }
-        view.image = image
-        view.animates = true
+    var body: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                isExpanded.wrappedValue.toggle()
+            }
+        } label: {
+            HStack(spacing: 8) {
+                label()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(isExpanded.wrappedValue
+            ? l10n.s.disclosureExpanded : l10n.s.disclosureCollapsed)
+    }
+}
+
+extension View {
+    /// Child rows sit inset under their group's header row.
+    func disclosureIndent() -> some View {
+        padding(.leading, 25)
     }
 }

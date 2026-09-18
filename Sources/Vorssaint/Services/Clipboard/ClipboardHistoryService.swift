@@ -26,6 +26,7 @@ final class ClipboardHistoryService: ObservableObject {
     @Published private(set) var entries: [ClipboardHistoryEntry] = [] {
         didSet { entriesStamp &+= 1 }
     }
+    let capturedEntry = PassthroughSubject<ClipboardHistoryEntry, Never>()
     @Published private(set) var isRunning = false
     @Published private(set) var shortcutRegistrationFailed = false
     @Published private(set) var quickBatchEntryIDs: Set<UUID> = []
@@ -39,7 +40,9 @@ final class ClipboardHistoryService: ObservableObject {
     @Published private(set) var quickSelectionIndex = 0
     @Published private(set) var quickSelectionIsVisible = false
     @Published private(set) var quickWindowPresentationID = UUID()
-    @Published private(set) var quickPreviewPresented = false
+    @Published private(set) var quickPreviewPresented = UserDefaults.standard.bool(
+        forKey: DefaultsKey.clipboardHistoryQuickPreview
+    )
 
     private var timer: Timer?
     private var lastChangeCount = 0
@@ -48,11 +51,11 @@ final class ClipboardHistoryService: ObservableObject {
     /// blocked main thread stalls every event tap with it, so typing freezes
     /// system wide (issue #189). The shared access lane also keeps the URL
     /// cleaner from touching AppKit's mutable pasteboard cache concurrently.
-    private var captureInFlight = false
-    /// Each capture attempt carries a token so a read that wedged behind a
-    /// password prompt can be abandoned without a stale completion (or a stuck
-    /// in-flight flag) ever disabling history for good.
-    private var captureGeneration = 0
+    private var captureState = ClipboardHistoryCaptureState()
+    /// Keep at most one history write queued or executing, even after its
+    /// caller timed out. A blocked provider cannot accumulate user actions.
+    private var copyInFlight = false
+    private static let pasteboardTimeout: TimeInterval = 5
     private var panel: NSPanel?
     private var keyMonitor: Any?
     private var localClickMonitor: Any?
@@ -68,6 +71,7 @@ final class ClipboardHistoryService: ObservableObject {
     private static let persistQueue = DispatchQueue(label: "com.vorssaint.utils.clipboard-persist",
                                                     qos: .utility)
     private var persistScheduled = false
+    private var persistenceGeneration = 0
     /// True while the history still lives in the legacy UserDefaults blob;
     /// only a store-file write that really landed retires that blob, so a
     /// crash mid-migration never loses entries.
@@ -95,81 +99,93 @@ final class ClipboardHistoryService: ObservableObject {
         lastChangeCount = max(lastChangeCount, changeCount)
     }
 
-    @discardableResult
-    func copy(_ entry: ClipboardHistoryEntry) -> Bool {
-        guard writeToPasteboard([entry]) else { return false }
-        touch([entry.id])
-        return true
+    func copy(_ entry: ClipboardHistoryEntry, completion: @escaping (Bool) -> Void) {
+        writeToPasteboard([entry]) { [weak self] copied in
+            if copied { self?.touch([entry.id]) }
+            completion(copied)
+        }
     }
 
-    @discardableResult
-    func copy(_ selectedEntries: [ClipboardHistoryEntry]) -> Bool {
-        guard !selectedEntries.isEmpty, writeToPasteboard(selectedEntries) else { return false }
-        touch(selectedEntries.map(\.id))
-        return true
+    func copy(_ selectedEntries: [ClipboardHistoryEntry], completion: @escaping (Bool) -> Void) {
+        guard !selectedEntries.isEmpty else {
+            completion(false)
+            return
+        }
+        writeToPasteboard(selectedEntries) { [weak self] copied in
+            if copied { self?.touch(selectedEntries.map(\.id)) }
+            completion(copied)
+        }
     }
 
-    /// Resolves the payload before touching the pasteboard: a stale entry
-    /// (image purged from the store, files deleted or on an ejected volume)
-    /// must abort with the user's current clipboard intact, not after a
-    /// clearContents() already destroyed it.
-    private func writeToPasteboard(_ list: [ClipboardHistoryEntry]) -> Bool {
-        GeneralPasteboardAccess.shared.sync {
-            let pasteboard = NSPasteboard.general
-
-            if list.count == 1, let entry = list.first {
-                switch entry.kind {
-                case .text:
-                    pasteboard.clearContents()
-                    pasteboard.setString(entry.text, forType: .string)
-                case .image:
-                    guard let name = entry.imageFile,
-                          let data = ClipboardImageStore.imageData(named: name) else { return false }
-                    pasteboard.clearContents()
-                    pasteboard.setData(data, forType: .png)
-                    // TIFF alongside PNG: some paste targets only take TIFF.
-                    if let tiff = NSBitmapImageRep(data: data)?.tiffRepresentation {
-                        pasteboard.setData(tiff, forType: .tiff)
-                    }
-                case .files:
-                    let urls = entry.filePaths
-                        .map { URL(fileURLWithPath: $0) }
-                        .filter { FileManager.default.fileExists(atPath: $0.path) }
-                    guard !urls.isEmpty else { return false }
-                    pasteboard.clearContents()
-                    pasteboard.writeObjects(urls as [NSURL])
-                }
-                lastChangeCount = pasteboard.changeCount
-                return true
+    /// Failure includes an expired request. The lane remains serialized and
+    /// admission stays occupied until the underlying operation actually ends.
+    private func writeToPasteboard(_ list: [ClipboardHistoryEntry],
+                                   completion: @escaping (Bool) -> Void) {
+        guard !copyInFlight, let write = Self.plannedWrite(for: list) else {
+            completion(false)
+            return
+        }
+        copyInFlight = true
+        GeneralPasteboardAccess.shared.async(timeout: Self.pasteboardTimeout, { isExpired in
+            write.write(to: NSPasteboard.general, isExpired: isExpired)
+        }, then: { result in
+            completion(result?.succeeded == true)
+        }, didFinish: { [weak self] result in
+            guard let self else { return }
+            self.copyInFlight = false
+            // Consume our mutation even if result delivery already expired.
+            // This also excludes a partial write whose required format failed.
+            if let result {
+                self.lastChangeCount = max(self.lastChangeCount, result.changeCount)
             }
+        })
+    }
 
-            // Batches: an all-files selection pastes as the files themselves; a
-            // selection with images pastes as rich text with the images embedded;
-            // anything else combines as text (files contribute paths).
-            switch ClipboardHistoryBatch.pasteMode(for: list) {
-            case let .files(paths):
-                let urls = paths.map { URL(fileURLWithPath: $0) }
+    /// What to put on the pasteboard once it is cleared, or nil when the
+    /// content is gone (image purged from the store, files deleted or on an
+    /// ejected volume) and the copy must abort with the user's clipboard
+    /// intact. Resolving on the caller's thread also keeps the AppKit work a
+    /// write may need — RTFD attachments, TIFF rendering — on the main thread
+    /// it has always run on; only the pasteboard calls move to the lane.
+    private static func plannedWrite(for list: [ClipboardHistoryEntry])
+        -> ClipboardHistoryWrite? {
+        if list.count == 1, let entry = list.first {
+            switch entry.kind {
+            case .text:
+                return .text(entry.text)
+            case .image:
+                guard let name = entry.imageFile,
+                      let data = ClipboardImageStore.imageData(named: name) else { return nil }
+                // TIFF alongside PNG: some paste targets only take TIFF.
+                let tiff = NSBitmapImageRep(data: data)?.tiffRepresentation
+                return .image(png: data, tiff: tiff)
+            case .files:
+                let urls = entry.filePaths
+                    .map { URL(fileURLWithPath: $0) }
                     .filter { FileManager.default.fileExists(atPath: $0.path) }
-                guard !urls.isEmpty else { return false }
-                pasteboard.clearContents()
-                pasteboard.writeObjects(urls as [NSURL])
-            case let .text(combined):
-                pasteboard.clearContents()
-                pasteboard.setString(combined, forType: .string)
-            case let .rich(parts):
-                guard let rich = Self.richBatchAttributedString(parts) else { return false }
-                pasteboard.clearContents()
-                pasteboard.writeObjects([rich])
-                let plain = ClipboardHistoryBatch.richPlainText(parts)
-                if !plain.isEmpty {
-                    pasteboard.setString(plain, forType: .string)
-                }
-            case nil:
-                guard let first = list.first else { return false }
-                return writeToPasteboard([first])
+                guard !urls.isEmpty else { return nil }
+                return .files(urls as [NSURL])
             }
-            lastChangeCount = pasteboard.changeCount
-            return true
+        }
+
+        // Batches: an all-files selection pastes as the files themselves; a
+        // selection with images pastes as rich text with the images embedded;
+        // anything else combines as text (files contribute paths).
+        switch ClipboardHistoryBatch.pasteMode(for: list) {
+        case let .files(paths):
+            let urls = paths.map { URL(fileURLWithPath: $0) }
+                .filter { FileManager.default.fileExists(atPath: $0.path) }
+            guard !urls.isEmpty else { return nil }
+            return .files(urls as [NSURL])
+        case let .text(combined):
+            return .text(combined)
+        case let .rich(parts):
+            guard let rich = richBatchAttributedString(parts) else { return nil }
+            let plain = ClipboardHistoryBatch.richPlainText(parts)
+            return .rich(rich, plain: plain)
+        case nil:
+            guard let first = list.first else { return nil }
+            return plannedWrite(for: [first])
         }
     }
 
@@ -417,13 +433,27 @@ final class ClipboardHistoryService: ObservableObject {
         quickSelectionIndex = clampedQuickSelectionIndex(for: filteredQuickEntries.count)
     }
 
-    func removeSelectedQuickEntry() {
-        guard let entry = selectedQuickEntry else { return }
-        remove(entry)
+    func removeSelectedQuickEntries() {
+        let selectedEntries = quickEntriesForPrimaryAction()
+        guard !selectedEntries.isEmpty else { return }
+        let idsToRemove = Set(selectedEntries.map(\.id))
+        entries.removeAll { idsToRemove.contains($0.id) }
+        var selected = quickBatchEntryIDs
+        selected.subtract(idsToRemove)
+        quickBatchEntryIDs = selected
         quickSelectionIndex = clampedQuickSelectionIndex(for: filteredQuickEntries.count)
+        save()
     }
 
+    /// Where the pointer sat when the keyboard last moved the selection. Rows
+    /// scrolling under a still pointer report hover, and hover would otherwise
+    /// take the preview back from the row the arrow keys chose.
+    private(set) var keyboardSelectionPointer: NSPoint?
+
     func moveQuickSelection(_ delta: Int) {
+        // Out of the way while the keys drive, back at the first real move.
+        NSCursor.setHiddenUntilMouseMoves(true)
+        keyboardSelectionPointer = NSEvent.mouseLocation
         let count = filteredQuickEntries.count
         guard count > 0 else {
             quickSelectionIndex = 0
@@ -438,34 +468,47 @@ final class ClipboardHistoryService: ObservableObject {
         quickSelectionIndex = min(max(quickSelectionIndex + delta, 0), count - 1)
     }
 
+    /// The window leaves the screen at once; the paste waits for the write,
+    /// because pasting before it lands would paste whatever the user had
+    /// copied before. A stale entry leaves the clipboard untouched and pastes
+    /// nothing at all.
     func copyQuickEntry(_ entry: ClipboardHistoryEntry) {
-        let copied = copy(entry)
         let target = pasteTargetApp
         hideHistoryWindow()
         pasteTargetApp = nil
-        // A stale entry leaves the clipboard untouched; pasting now would
-        // paste whatever the user had copied before, out of nowhere.
-        guard copied else { return }
-        pasteIntoPreviousApp(target)
+        copy(entry) { [weak self] copied in
+            guard copied else {
+                NSSound.beep()
+                return
+            }
+            self?.pasteIntoPreviousApp(target)
+        }
     }
 
     func copyQuickEntries(_ selectedEntries: [ClipboardHistoryEntry]) {
-        let copied = copy(selectedEntries)
         let target = pasteTargetApp
         hideHistoryWindow()
         pasteTargetApp = nil
-        guard copied else { return }
-        pasteIntoPreviousApp(target)
+        copy(selectedEntries) { [weak self] copied in
+            guard copied else {
+                NSSound.beep()
+                return
+            }
+            self?.pasteIntoPreviousApp(target)
+        }
     }
 
+    /// No paste follows these two, so nothing has to wait for the write: the
+    /// window closes now and a stale entry simply leaves the clipboard as the
+    /// user left it.
     func copyOnlyQuickEntry(_ entry: ClipboardHistoryEntry) {
-        copy(entry)
+        copy(entry) { if !$0 { NSSound.beep() } }
         hideHistoryWindow()
         pasteTargetApp = nil
     }
 
     func copyOnlyQuickEntries(_ selectedEntries: [ClipboardHistoryEntry]) {
-        copy(selectedEntries)
+        copy(selectedEntries) { if !$0 { NSSound.beep() } }
         hideHistoryWindow()
         pasteTargetApp = nil
     }
@@ -483,7 +526,8 @@ final class ClipboardHistoryService: ObservableObject {
         self.timer = timer
         isRunning = true
         ClipboardIgnoredApps.shared.setHistoryRunning(true)
-        baselinePasteboard()
+        captureState.restart()
+        captureIfChanged()
     }
 
     private func stop() {
@@ -491,8 +535,7 @@ final class ClipboardHistoryService: ObservableObject {
         timer = nil
         isRunning = false
         ClipboardIgnoredApps.shared.setHistoryRunning(false)
-        captureGeneration &+= 1
-        captureInFlight = false
+        captureState.invalidate()
     }
 
     /// What the background pasteboard read hands back to the main thread.
@@ -502,72 +545,50 @@ final class ClipboardHistoryService: ObservableObject {
         case text(String)
     }
 
-    /// Establishes the starting change count on the same background lane used
-    /// by later reads. Existing clipboard content is not added just because
-    /// history was enabled, matching the previous synchronous baseline.
-    private func baselinePasteboard() {
-        guard !captureInFlight else { return }
-        captureInFlight = true
-        captureGeneration &+= 1
-        let generation = captureGeneration
-        scheduleCaptureTimeout(generation: generation)
-        GeneralPasteboardAccess.shared.async { [weak self] in
-            let changeCount = NSPasteboard.general.changeCount
-            DispatchQueue.main.async {
-                guard let self, self.captureGeneration == generation else { return }
-                self.captureInFlight = false
-                guard self.isRunning else { return }
-                self.lastChangeCount = max(self.lastChangeCount, changeCount)
-            }
-        }
-    }
-
-    private func scheduleCaptureTimeout(generation: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard let self, self.captureGeneration == generation, self.captureInFlight else { return }
-            self.captureInFlight = false
-        }
-    }
-
     private func captureIfChanged() {
-        // Only ever one read in flight: while a password prompt holds the
-        // pasteboard server, a read can take seconds, and letting ticks pile
-        // up would spawn a thread each time.
-        guard !captureInFlight else { return }
+        guard isRunning, let generation = captureState.begin() else { return }
+        // On start (including stop/start during a blocked read), establish a
+        // fresh baseline before capturing. Old completions cannot consume it.
+        let baseline = captureState.needsBaseline
         let sinceChangeCount = lastChangeCount
         let includeImagesFiles = UserDefaults.standard.bool(
             forKey: DefaultsKey.clipboardHistoryIncludeImagesFiles)
-        captureInFlight = true
-        captureGeneration &+= 1
-        let generation = captureGeneration
-        // If the read wedges (a pasteboard server stuck behind a lingering
-        // password prompt), free the flag so later copies are still recorded;
-        // the abandoned read is ignored by its stale generation when it ends.
-        scheduleCaptureTimeout(generation: generation)
-        GeneralPasteboardAccess.shared.async { [weak self] in
+        GeneralPasteboardAccess.shared.async(timeout: Self.pasteboardTimeout, { isExpired
+            -> (changeCount: Int, content: CapturedContent?)? in
             let changeCount = NSPasteboard.general.changeCount
-            let content: CapturedContent? = changeCount != sinceChangeCount
+            guard !isExpired() else { return nil }
+            let content: CapturedContent? = !baseline && changeCount != sinceChangeCount
                 ? Self.readPasteboard(includeImagesFiles: includeImagesFiles)
                 : nil
-            DispatchQueue.main.async {
-                guard let self, self.captureGeneration == generation else { return }
-                self.captureInFlight = false
-                // Asked once per check and before anything can return early,
-                // so the window it answers for always ends here: whether a
-                // listed app could be the one that copied since the last look.
-                let excludedSource = ClipboardIgnoredApps.shared.excludedSourceSinceLastCheck()
-                // Strictly forward: never re-capture a change that
-                // ignoreNextChange() consumed while the read was running.
-                guard changeCount > self.lastChangeCount else { return }
-                self.lastChangeCount = changeCount
-                guard self.isRunning, !excludedSource, let content else { return }
-                switch content {
-                case .files(let paths): self.promoteFiles(paths)
-                case .image(let image): self.promoteImage(image)
-                case .text(let text): self.promote(text)
-                }
+            return (changeCount, content)
+        }, then: { [weak self] result in
+            guard let self else { return }
+            guard let result else {
+                // A deadline invalidates immediately, not at the next poll.
+                // The actual in-flight slot is held until didFinish below.
+                self.captureState.expire(generation)
+                return
             }
-        }
+            guard self.isRunning, self.captureState.accepts(generation) else { return }
+            if baseline {
+                self.lastChangeCount = max(self.lastChangeCount, result.changeCount)
+                self.captureState.didBaseline()
+                return
+            }
+            // Preserve exclusion over the whole time since the previous
+            // accepted check, including any read that expired in between.
+            let excludedSource = ClipboardIgnoredApps.shared.excludedSourceSinceLastCheck()
+            guard result.changeCount > self.lastChangeCount else { return }
+            self.lastChangeCount = result.changeCount
+            guard !excludedSource, let content = result.content else { return }
+            switch content {
+            case .files(let paths): self.promoteFiles(paths)
+            case .image(let image): self.promoteImage(image)
+            case .text(let text): self.promote(text)
+            }
+        }, didFinish: { [weak self] _ in
+            self?.captureState.finish()
+        })
     }
 
     /// Runs on the shared pasteboard lane: everything in here may block behind
@@ -619,7 +640,7 @@ final class ClipboardHistoryService: ObservableObject {
         -> (data: Data, width: Int, height: Int)? {
         let png = pasteboard.data(forType: .png)
         guard let source = png ?? pasteboard.data(forType: .tiff),
-              source.count <= maxRawImageBytes,
+              source.count <= (png == nil ? maxRawImageBytes : maxImageBytes),
               let rep = NSBitmapImageRep(data: source),
               rep.pixelsWide > 0, rep.pixelsHigh > 0
         else { return nil }
@@ -728,11 +749,15 @@ final class ClipboardHistoryService: ObservableObject {
         save()
     }
 
-    private func trimToLimit() {
+    func trimToLimit() {
         let limit = Defaults.sanitizedClipboardHistoryLimit(
             UserDefaults.standard.integer(forKey: DefaultsKey.clipboardHistoryLimit)
         )
-        entries = ClipboardHistoryEditing.retainedEntries(entries, recentLimit: limit)
+        let trimmed = ClipboardHistoryEditing.retainedEntries(entries, recentLimit: limit)
+        if trimmed != entries {
+            entries = trimmed
+            save()
+        }
     }
 
     private var firstRecentIndex: Int {
@@ -745,6 +770,7 @@ final class ClipboardHistoryService: ObservableObject {
         } else {
             entries.insert(entry, at: firstRecentIndex)
         }
+        capturedEntry.send(entry)
     }
 
     private func normalizeEntryOrder() {
@@ -817,7 +843,8 @@ final class ClipboardHistoryService: ObservableObject {
         normalizeEntryOrder()
         trimToLimit()
         // Sweep image files that lost their entry (crash between write and save).
-        ClipboardImageStore.cleanup(keeping: Set(entries.compactMap(\.imageFile)))
+        ClipboardImageStore.cleanup(keeping: Set(entries.compactMap(\.imageFile)),
+                                    filePaths: Set(entries.flatMap(\.filePaths)))
         // A history read from the legacy blob migrates right away instead of
         // waiting for the next copy: launching once is enough to leave
         // UserDefaults behind.
@@ -828,6 +855,7 @@ final class ClipboardHistoryService: ObservableObject {
 
     /// Coalesces the saves of one mutation cycle into a single persist.
     private func save() {
+        persistenceGeneration &+= 1
         guard !persistScheduled else { return }
         persistScheduled = true
         DispatchQueue.main.async { [weak self] in
@@ -839,31 +867,38 @@ final class ClipboardHistoryService: ObservableObject {
 
     private func persist() {
         let snapshot = entries
+        let generation = persistenceGeneration
         let retireLegacyBlob = migrateLegacyBlob
         Self.persistQueue.async { [weak self] in
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            guard let encoded = ClipboardHistoryEditing.encodedHistory(snapshot) else { return }
+            let data = encoded.data
             // The PNG sweep waits for the JSON to land and runs back on the
             // main thread against the list as it is then. Sweeping first
             // could strand an entry whose PNG died if the process fell in
             // between; the reverse at worst leaves an orphaned PNG that the
             // launch sweep heals. The main thread also keeps it from racing
             // a just-stored PNG whose entry has not landed in the list yet.
-            func sweepAfterPersist() {
+            func finishPersist() {
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    ClipboardImageStore.cleanup(keeping: Set(self.entries.compactMap(\.imageFile)))
+                    if self.persistenceGeneration == generation,
+                       encoded.entries != snapshot {
+                        self.entries = encoded.entries
+                    }
+                    ClipboardImageStore.cleanup(keeping: Set(self.entries.compactMap(\.imageFile)),
+                                                filePaths: Set(self.entries.flatMap(\.filePaths)))
                 }
             }
             guard let url = Self.storeURL else {
                 UserDefaults.standard.set(data, forKey: DefaultsKey.clipboardHistoryEntries)
-                sweepAfterPersist()
+                finishPersist()
                 return
             }
             PrivateFileStore.createDirectory(at: url.deletingLastPathComponent())
             // Only a write that really landed retires the legacy blob, so a
             // failed save leaves the history readable from somewhere.
             guard PrivateFileStore.write(data, to: url) else { return }
-            sweepAfterPersist()
+            finishPersist()
             if retireLegacyBlob {
                 UserDefaults.standard.removeObject(forKey: DefaultsKey.clipboardHistoryEntries)
                 DispatchQueue.main.async { self?.migrateLegacyBlob = false }
@@ -951,6 +986,7 @@ final class ClipboardHistoryService: ObservableObject {
     func setQuickPreviewPresented(_ presented: Bool) {
         guard presented != quickPreviewPresented else { return }
         quickPreviewPresented = presented
+        UserDefaults.standard.set(presented, forKey: DefaultsKey.clipboardHistoryQuickPreview)
         guard let panel, panel.isVisible else { return }
         resize(panel,
                to: presented ? Self.quickPanelPreviewSize : Self.quickPanelCompactSize,
@@ -958,6 +994,7 @@ final class ClipboardHistoryService: ObservableObject {
     }
 
     func toggleHistoryWindow() {
+        if NotchSupport.routesClipboardWindow(), NotchService.shared.showClipboard(toggle: true) { return }
         if panel?.isVisible == true {
             hideHistoryWindow()
         } else {
@@ -965,14 +1002,14 @@ final class ClipboardHistoryService: ObservableObject {
         }
     }
 
-    func showHistoryWindow() {
+    func showHistoryWindow(preferNotch: Bool = true) {
+        if preferNotch, NotchSupport.routesClipboardWindow(), NotchService.shared.showClipboard() { return }
         let panel = ensurePanel()
         rememberPasteTarget()
         quickWindowPresentationID = UUID()
         quickQuery = ""
         clearQuickBatchSelection()
         resetQuickSelection()
-        quickPreviewPresented = false
         position(panel)
         installKeyMonitor(for: panel)
         installDismissMonitors(for: panel)
@@ -986,10 +1023,9 @@ final class ClipboardHistoryService: ObservableObject {
         removeDismissMonitors()
         panel?.orderOut(nil)
         clearQuickBatchSelection()
-        quickPreviewPresented = false
     }
 
-    private func rememberPasteTarget() {
+    func rememberPasteTarget() {
         let ownBundleID = Bundle.main.bundleIdentifier
         guard let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier != ownBundleID,
@@ -1027,7 +1063,8 @@ final class ClipboardHistoryService: ObservableObject {
 
     private func ensurePanel() -> NSPanel {
         if let panel { return panel }
-        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: Self.quickPanelCompactSize),
+        let initialSize = quickPreviewPresented ? Self.quickPanelPreviewSize : Self.quickPanelCompactSize
+        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: initialSize),
                             styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
                             backing: .buffered,
                             defer: false)
@@ -1051,14 +1088,14 @@ final class ClipboardHistoryService: ObservableObject {
         // to the panel height a second time.
         host.sizingOptions = []
         panel.contentViewController = host
-        panel.setFrame(NSRect(origin: .zero, size: Self.quickPanelCompactSize),
+        panel.setFrame(NSRect(origin: .zero, size: initialSize),
                        display: false)
         self.panel = panel
         return panel
     }
 
     private func position(_ panel: NSPanel) {
-        let size = Self.quickPanelCompactSize
+        let size = quickPreviewPresented ? Self.quickPanelPreviewSize : Self.quickPanelCompactSize
         let screen = NSScreen.pointerVisibleFrame
         let x = screen.midX - size.width / 2
         let y = min(screen.maxY - size.height - 54, screen.midY - size.height / 2)
@@ -1090,22 +1127,22 @@ final class ClipboardHistoryService: ObservableObject {
         removeKeyMonitor()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self, weak panel] event in
             guard let self, let panel, event.window === panel else { return event }
-            // A multiline editor owns its normal editing keys. The search box
-            // uses a field editor, so its existing list shortcuts stay intact.
+            // A multiline editor owns its normal editing keys, and any field
+            // still composing owns them too. Outside composition the search
+            // box keeps the list's shortcuts, as does the read-only preview:
+            // only ⌘C and ⌘A, which the list declines below when nothing is
+            // batch-selected, reach it.
             if let textView = panel.firstResponder as? NSTextView,
-               !textView.isFieldEditor {
+               ClipboardHistoryFocus.textViewOwnsKeys(isComposing: textView.hasMarkedText(),
+                                                      isFieldEditor: textView.isFieldEditor,
+                                                      isEditable: textView.isEditable) {
                 return event
             }
             let modifiers = event.modifierFlags.intersection([.command, .option, .shift, .control])
             if event.keyCode == UInt16(kVK_Escape) {
-                // Esc backs out one layer at a time: preview, selection,
-                // then the window.
-                if self.quickPreviewPresented {
-                    self.setQuickPreviewPresented(false)
-                } else if self.quickBatchCount > 0 {
-                    self.clearQuickBatchSelection()
-                } else {
-                    self.hideHistoryWindow()
+                switch ClipboardHistoryEscape.action(batchCount: self.quickBatchCount) {
+                case .clearBatchSelection: self.clearQuickBatchSelection()
+                case .hideWindow: self.hideHistoryWindow()
                 }
                 return nil
             }
@@ -1153,9 +1190,10 @@ final class ClipboardHistoryService: ObservableObject {
                 self.togglePinSelectedQuickEntry()
                 return nil
             }
-            if modifiers == [.option],
+            if (modifiers == [.option]
+                || (modifiers == [.command] && ClipboardHistoryBatch.listOwnsDeleteShortcut(batchCount: self.quickBatchCount))),
                event.keyCode == UInt16(kVK_Delete) || event.keyCode == UInt16(kVK_ForwardDelete) {
-                self.removeSelectedQuickEntry()
+                self.removeSelectedQuickEntries()
                 return nil
             }
             if event.keyCode == UInt16(kVK_DownArrow) {
@@ -1187,7 +1225,10 @@ final class ClipboardHistoryService: ObservableObject {
         }
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) { [weak self, weak panel] event in
             guard let self, let panel, panel.isVisible else { return }
-            if event.windowNumber != panel.windowNumber, !Self.mouseIsInside(panel) {
+            if event.windowNumber != panel.windowNumber, !Self.mouseIsInside(panel),
+               // Every key on the Accessibility Keyboard is a click outside this
+               // panel. Dismissing on those makes the panel impossible to type into.
+               !AssistiveKeyboard.ownsCocoaPoint(NSEvent.mouseLocation) {
                 self.hideHistoryWindow()
             }
         }
@@ -1198,7 +1239,8 @@ final class ClipboardHistoryService: ObservableObject {
         ) { [weak self] notification in
             guard let self,
                   let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  app.bundleIdentifier != Bundle.main.bundleIdentifier
+                  app.bundleIdentifier != Bundle.main.bundleIdentifier,
+                  app.bundleIdentifier != AssistiveKeyboard.bundleID
             else { return }
             self.hideHistoryWindow()
         }
@@ -1330,7 +1372,84 @@ enum ClipboardImageStore {
         return image
     }
 
-    static func cleanup(keeping names: Set<String>) {
+    /// The Finder icon for a path, cached: the workspace lookup is a round
+    /// trip, and a list row asks for it every time it is drawn.
+    static func fileIcon(atPath path: String) -> NSImage {
+        if let cached = fileIcons.object(forKey: path as NSString) { return cached }
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        fileIcons.setObject(icon, forKey: path as NSString)
+        fileIconPaths = fileIconPaths.filter { fileIcons.object(forKey: $0 as NSString) != nil }
+        fileIconPaths.insert(path)
+        return icon
+    }
+
+    private static var fileIconPaths: Set<String> = []
+    private static let fileIcons: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 120
+        return cache
+    }()
+
+    static func isImageFile(atPath path: String) -> Bool {
+        ClipboardHistoryImageSupport.isImageFilePath(path)
+    }
+
+    /// Downsampled preview for a copied image file on disk, cached.
+    static func fileThumbnail(atPath path: String, maxPixelSize: CGFloat = 480) -> NSImage? {
+        let key = "file:\(path):\(Int(maxPixelSize))" as NSString
+        if let cached = thumbnails.object(forKey: key) {
+            return cached
+        }
+        guard isImageFile(atPath: path) else { return nil }
+        let url = URL(fileURLWithPath: path)
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+        else { return nil }
+        let image = NSImage(cgImage: cgImage, size: .zero)
+        thumbnails.setObject(image, forKey: key,
+                             cost: cgImage.bytesPerRow * cgImage.height)
+        return image
+    }
+
+    static func imageDimensions(atPath path: String) -> (width: Int, height: Int)? {
+        guard isImageFile(atPath: path) else { return nil }
+        let url = URL(fileURLWithPath: path)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        else { return nil }
+        guard let rawWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let rawHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              rawWidth > 0, rawHeight > 0
+        else { return nil }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+        if (5...8).contains(orientation) {
+            return (rawHeight, rawWidth)
+        }
+        return (rawWidth, rawHeight)
+    }
+
+    static func imageDimensionsLabel(atPath path: String) -> String? {
+        guard let dim = imageDimensions(atPath: path) else { return nil }
+        return "\(dim.width)×\(dim.height)"
+    }
+
+    static func fileSizeString(atPath path: String) -> String? {
+        guard let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.fileSizeKey]),
+              let bytes = values.fileSize, bytes >= 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    static func cleanup(keeping names: Set<String>, filePaths: Set<String>) {
+        for path in fileIconPaths where !filePaths.contains(path) {
+            fileIcons.removeObject(forKey: path as NSString)
+        }
+        fileIconPaths.formIntersection(filePaths)
         guard let directory,
               let files = try? FileManager.default.contentsOfDirectory(at: directory,
                                                                        includingPropertiesForKeys: nil)

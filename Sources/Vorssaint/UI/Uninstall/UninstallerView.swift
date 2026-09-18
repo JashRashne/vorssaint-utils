@@ -11,6 +11,7 @@ struct UninstallerView: View {
     @ObservedObject private var uninstaller = AppUninstaller.shared
     @ObservedObject private var homebrew = HomebrewManager.shared
     @ObservedObject private var permissions = Permissions.shared
+    @AppStorage(DefaultsKey.uninstallerCommandBarEnabled) private var commandBarEnabled = false
     @State private var dropTargeted = false
     @State private var showingAppPicker = false
     @State private var pendingHomebrewRemoval: HomebrewPackage?
@@ -46,6 +47,20 @@ struct UninstallerView: View {
 
     // MARK: Empty / drop
 
+    private var commandBarToggle: some View {
+        Form {
+            Section {
+                Toggle(l10n.s.uninstallerCommandBarToggle, isOn: $commandBarEnabled)
+                Text(l10n.s.uninstallerCommandBarCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 360)
+    }
+
     private var emptyState: some View {
         VStack(spacing: 20) {
             Spacer()
@@ -77,6 +92,8 @@ struct UninstallerView: View {
             Text(l10n.s.uninstallerEmptyNote)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+
+            commandBarToggle
 
             if !permissions.fullDiskAccess {
                 FullDiskAccessNote().frame(width: 360)
@@ -172,11 +189,27 @@ struct UninstallerView: View {
                 .resizable().frame(width: 22, height: 22)
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.name).font(.system(size: 12.5)).lineLimit(1).truncationMode(.middle)
-                Text(prettyPath(item.url))
-                    .font(.system(size: 10.5)).foregroundStyle(.tertiary)
-                    .lineLimit(1).truncationMode(.head)
+                HStack(spacing: 5) {
+                    if item.confidence == .related {
+                        Label(l10n.s.cleanerOptionalSection, systemImage: "questionmark.circle")
+                            .foregroundStyle(.orange)
+                    }
+                    Text(prettyPath(item.url))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                .font(.system(size: 10.5))
             }
             Spacer()
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.plain)
+            .help(l10n.s.cleanerRevealInFinder)
+            .accessibilityLabel(l10n.s.cleanerRevealInFinder)
             Text(Self.byteString(item.size))
                 .font(.system(size: 11.5)).foregroundStyle(.secondary)
                 .monospacedDigit()

@@ -40,7 +40,7 @@ direction rather than code.
 **Settle the direction, then write.** An agent builds whatever it is asked
 for; it has no way to know whether a thing belongs in this app. Open an issue,
 or find the one that exists — the [enhancement
-summary](https://github.com/vorssaintapp/vorssaint-utils/issues/838) sorts
+summary](https://github.com/vorssaint/vorssaint-utils/issues/838) sorts
 every open request into what shipped, what is worth doing, and what has been
 ruled out. Killing a direction before there is a branch costs an order of
 magnitude less than killing it after.
@@ -112,8 +112,8 @@ path, a network management protocol for a narrow audience: all declined.
 Narrow on its own is fine, and the app is full of things only some people ever
 switch on. Narrow **and** needing a new subsystem is what fails. The ratio to
 weigh is the permanent surface a feature adds — a service, a permission,
-settings, strings in thirteen languages — against how many people will ever
-turn it on.
+settings, strings in every locale — against how many people will ever turn
+it on.
 
 The ruled-out section of the enhancement summary linked above is the record of
 these four being applied, with the reasoning attached to each. It is worth
