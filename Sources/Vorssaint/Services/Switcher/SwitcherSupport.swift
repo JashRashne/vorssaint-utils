@@ -18,6 +18,14 @@ struct SwitcherActivationPlan: Equatable {
     let restoreSourceWhenTargetMinimizes: Bool
 }
 
+/// How the owning app is brought forward. App-level activation can raise
+/// sibling windows even without activateAllWindows, so a plan
+/// scoped to one window asks the window server to front that window alone.
+enum SwitcherAppActivationRoute: Equatable {
+    case exactWindow(CGWindowID)
+    case wholeApp
+}
+
 /// Shared by the bounded focus passes on the main thread. Once a pass sees
 /// a newer user action, the remaining passes cannot reclaim the old target.
 final class SwitcherWindowFocusRetryState {
@@ -46,6 +54,7 @@ final class SwitcherWindowFocusRetryState {
                         targetMinimizedState: Bool?,
                         targetAppWindowIDs: @autoclosure () -> Set<CGWindowID>,
                         targetAppFocusedWindowID: @autoclosure () -> CGWindowID?,
+                        ignoresForeground: Bool = false,
                         ownPID: pid_t = ProcessInfo.processInfo.processIdentifier) -> Bool {
         guard isActive else { return false }
         isActive = SwitcherSupport.shouldContinueFocusRetry(
@@ -58,6 +67,7 @@ final class SwitcherWindowFocusRetryState {
             knownWindowIDs: knownWindowIDs,
             targetAppWindowIDs: targetAppWindowIDs(),
             targetAppFocusedWindowID: targetAppFocusedWindowID(),
+            ignoresForeground: ignoresForeground,
             ownPID: ownPID
         )
         observe(targetMinimizedState: targetMinimizedState)
@@ -1256,6 +1266,14 @@ enum SwitcherSupport {
         activationPlan(targetsSpecificWindow: targetsSpecificWindow).activateAllWindows
     }
 
+    static func appActivationRoute(plan: SwitcherActivationPlan,
+                                   windowID: CGWindowID?) -> SwitcherAppActivationRoute {
+        if !plan.activateAllWindows, let windowID {
+            return .exactWindow(windowID)
+        }
+        return .wholeApp
+    }
+
     static func shouldRestoreSourceAfterTargetMinimize(targetPID: pid_t,
                                                        sourcePID: pid_t?,
                                                        frontmostPID: pid_t?,
@@ -1333,12 +1351,20 @@ enum SwitcherSupport {
                                          knownWindowIDs: Set<CGWindowID> = [],
                                          targetAppWindowIDs: @autoclosure () -> Set<CGWindowID> = [],
                                          targetAppFocusedWindowID: @autoclosure () -> CGWindowID? = nil,
+                                         ignoresForeground: Bool = false,
                                          ownPID: pid_t = ProcessInfo.processInfo.processIdentifier) -> Bool {
         guard !targetIsMinimized
                 || (targetStartedMinimized && !targetWasObservedRestored)
         else { return false }
         let initialFrontmostPID = frontmostPID()
-        if let sourcePID, let initialFrontmostPID,
+        // A hop travels across desktops, and the system fronts whatever sits
+        // on top of each one it passes. Which app is in front while that runs
+        // says nothing about where the user wants to be, and reading it as
+        // "they moved on" leaves the window they picked behind that app. Such
+        // a pass gives up for the one signal that does carry intent: the app
+        // moved to a window it opened after the switch.
+        if !ignoresForeground,
+           let sourcePID, let initialFrontmostPID,
            initialFrontmostPID != targetPID && initialFrontmostPID != sourcePID && initialFrontmostPID != ownPID {
             return false
         }
@@ -1346,13 +1372,13 @@ enum SwitcherSupport {
         // may sit above a real window. Only query Accessibility when this app
         // is active and the cheap window-server list contains something new.
         // An unavailable focus reading preserves the previous retry behavior.
-        guard initialFrontmostPID == targetPID,
+        guard ignoresForeground || initialFrontmostPID == targetPID,
               !knownWindowIDs.isEmpty,
               !targetAppWindowIDs().isSubset(of: knownWindowIDs) else { return true }
         let focusedWindowID = targetAppFocusedWindowID()
         // Accessibility can wait on the other process. Do not act on the old
         // foreground observation if the user left the app during that wait.
-        guard frontmostPID() == targetPID else { return false }
+        if !ignoresForeground, frontmostPID() != targetPID { return false }
         guard let focusedWindowID else { return true }
         return knownWindowIDs.contains(focusedWindowID)
     }
